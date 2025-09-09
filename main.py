@@ -48,10 +48,21 @@ JSON_FILE = "ftm.json"
 pending_questions: Dict[int, str] = {}    # user_id -> question waiting for answer
 personal_learn_sessions = set()           # user_ids in personal learn mode
 edit_sessions: Dict[int, Dict[str, Any]] = {}  # user_id -> {"qid": qid, "mode": "q"/"a"}
+info_collection_sessions: Dict[int, Dict[str, Any]] = {}  # user_id -> {"step": int, "data": {}}
 
 # Enhanced learning cache
 name_patterns = {}  # user_id -> {"name": "value", "patterns": [list of questions]}
 keyword_index = defaultdict(list)  # keyword -> list of (user_id, fact_index) tuples
+
+# Personal info collection questions
+PERSONAL_INFO_QUESTIONS = [
+    {"key": "name", "question": "What's your full name?"},
+    {"key": "age", "question": "How old are you?"},
+    {"key": "location", "question": "Where are you from? (city/country)"},
+    {"key": "occupation", "question": "What do you do for work or study?"},
+    {"key": "interests", "question": "What are your interests or hobbies?"},
+    {"key": "goals", "question": "What are you hoping to learn or achieve?"}
+]
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -160,18 +171,33 @@ def ensure_user_stats_obj(user) -> None:
             },
             "personal_facts": [],  # list of short strings (facts/sentences)
             "name": None,  # extracted name from conversations
-            "topics": {}  # topic -> [related facts] for better organization
+            "topics": {},  # topic -> [related facts] for better organization
+            "info_collected": False,  # whether personal info has been collected
+            "info_declined": False,  # whether user declined to share info
+            "age": None,
+            "location": None,
+            "occupation": None,
+            "interests": None,
+            "goals": None
         }
         save_db(data)
     else:
         # keep username up to date
         data["users"][uid]["username"] = user.username or user.first_name or data["users"][uid].get("username", "")
         # Ensure new fields exist
-        if "name" not in data["users"][uid]:
-            data["users"][uid]["name"] = None
-        if "topics" not in data["users"][uid]:
-            data["users"][uid]["topics"] = {}
-        save_db(data)
+        fields_to_ensure = ["name", "topics", "info_collected", "info_declined", "age", "location", "occupation", "interests", "goals"]
+        changed = False
+        for field in fields_to_ensure:
+            if field not in data["users"][uid]:
+                if field in ["info_collected", "info_declined"]:
+                    data["users"][uid][field] = False
+                elif field == "topics":
+                    data["users"][uid][field] = {}
+                else:
+                    data["users"][uid][field] = None
+                changed = True
+        if changed:
+            save_db(data)
 
 def increment_user_stat(user, stat: str, amount: int = 1):
     if stat not in ("messages", "questions", "answers", "teaches", "sessions"):
@@ -229,7 +255,7 @@ def delete_knowledge(qid: str, deleter):
 # per-user personal_facts functions
 def add_personal_facts_from_text(user, text: str):
     """
-    Enhanced: Splits text into sentences, extracts names, and stores with better structure
+    Enhanced: Parses structured notes and personal information with better organization
     """
     ensure_user_stats_obj(user)
     data = load_db()
@@ -241,19 +267,54 @@ def add_personal_facts_from_text(user, text: str):
         data["users"][uid]["name"] = extracted_name
         logger.info(f"Stored name '{extracted_name}' for user {uid}")
     
-    # Split into sentences for better organization  
-    try:
-        sentences = sent_tokenize(text)
-    except:
-        # Fallback if NLTK fails
-        sentences = re.split(r"[.?!]\s*", text.strip())
+    # Extract personal information from new users
+    personal_info = extract_personal_info(text)
+    if personal_info:
+        for key, value in personal_info.items():
+            data["users"][uid][key] = value
+        logger.info(f"Stored personal info for user {uid}: {list(personal_info.keys())}")
     
-    for sentence in sentences:
-        s = sentence.strip()
-        if len(s) > 5:  # Slightly longer minimum for quality
-            # Avoid storing duplicate facts
-            if s not in data["users"][uid]["personal_facts"]:
-                data["users"][uid]["personal_facts"].append(s)
+    # Check if this is a structured note (like "Genetics – Short Note")
+    topic_match = re.match(r'^([A-Za-z\s]+)\s*[–-]\s*(.+?)$', text.split('\n')[0])
+    if topic_match:
+        topic = topic_match.group(1).strip()
+        note_type = topic_match.group(2).strip()
+        
+        # Store the entire note as a single structured entry
+        structured_note = f"{topic}: {text}"
+        if structured_note not in data["users"][uid]["personal_facts"]:
+            data["users"][uid]["personal_facts"].append(structured_note)
+        
+        # Also parse individual bullet points and definitions
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('- ') or line.startswith('• '):
+                # Handle bullet points like "- Gene: A unit of heredity..."
+                bullet_content = line[2:].strip()
+                if ':' in bullet_content:
+                    term, definition = bullet_content.split(':', 1)
+                    structured_fact = f"{topic} - {term.strip()}: {definition.strip()}"
+                    if structured_fact not in data["users"][uid]["personal_facts"]:
+                        data["users"][uid]["personal_facts"].append(structured_fact)
+            elif re.match(r'^\d+\.', line):
+                # Handle numbered lists like Mendel's Laws
+                if ':' in line or '–' in line:
+                    structured_fact = f"{topic} - {line}"
+                    if structured_fact not in data["users"][uid]["personal_facts"]:
+                        data["users"][uid]["personal_facts"].append(structured_fact)
+    else:
+        # Regular text processing
+        try:
+            sentences = sent_tokenize(text)
+        except:
+            sentences = re.split(r"[.?!]\s*", text.strip())
+        
+        for sentence in sentences:
+            s = sentence.strip()
+            if len(s) > 5:
+                if s not in data["users"][uid]["personal_facts"]:
+                    data["users"][uid]["personal_facts"].append(s)
     
     save_db(data)
 
@@ -342,6 +403,43 @@ def find_answer_by_question(text: str) -> Tuple[Optional[str], Optional[Dict[str
     
     return None, None
 
+def extract_personal_info(text: str) -> Dict[str, str]:
+    """Extract personal information like age, interests, etc."""
+    info = {}
+    text_lower = text.lower()
+    
+    # Extract age
+    age_patterns = [
+        r'i am (\d+) years? old',
+        r'my age is (\d+)',
+        r'age[:\s]+(\d+)',
+        r'(\d+) years? old'
+    ]
+    for pattern in age_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            info['age'] = match.group(1)
+            break
+    
+    # Extract interests/hobbies
+    interest_patterns = [
+        r'my interests? (?:are?|include)[:\s]*([^.!?]+)',
+        r'i (?:like|love|enjoy)[:\s]*([^.!?]+)',
+        r'hobbies?[:\s]*([^.!?]+)',
+        r'i study[:\s]*([^.!?]+)',
+        r'studying[:\s]*([^.!?]+)'
+    ]
+    for pattern in interest_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            interests = match.group(1).strip()
+            if 'interests' not in info:
+                info['interests'] = interests
+            else:
+                info['interests'] += f", {interests}"
+    
+    return info
+
 def extract_name_from_text(text: str) -> Optional[str]:
     """Extract name from phrases like 'my name is John' or 'I am John'"""
     text_lower = text.lower().strip()
@@ -396,9 +494,25 @@ def is_name_question(query: str, name: str) -> bool:
     return False
 
 def check_name_question_for_user(query: str, user) -> Optional[str]:
-    """Check if the query is asking about any user's name, return appropriate response"""
+    """Check if the query is asking about any user's name or bot's name, return appropriate response"""
     data = load_db()
     query_lower = query.lower().strip()
+    
+    # Check if asking about bot's name (you/your refers to bot)
+    bot_name_questions = [
+        "what is your name",
+        "what's your name",
+        "who are you",
+        "what are you called",
+        "your name",
+        "tell me your name",
+        "what do you call yourself",
+        "what should i call you"
+    ]
+    
+    for pattern in bot_name_questions:
+        if query_lower == pattern or query_lower == pattern + "?":
+            return "I'm Tejas AI, created by Fᴛᴍ Dᴇᴠᴇʟᴏᴘᴇʀᴢ. I'm here to help you learn and remember information! shared by you."
     
     # Check all users for name matches
     for uid, user_data in data["users"].items():
@@ -409,7 +523,7 @@ def check_name_question_for_user(query: str, user) -> Optional[str]:
             # Check if asking about this specific name
             if f"who is {name_lower}" in query_lower or f"who is {name_lower}?" in query_lower:
                 if uid == str(user.id):
-                    return f"{stored_name} is your name."
+                    return f"You are {stored_name}."
                 else:
                     username = user_data.get("username", "someone")
                     return f"{stored_name} is the name of {username}."
@@ -423,8 +537,6 @@ def check_name_question_for_user(query: str, user) -> Optional[str]:
             own_name_questions = [
                 "what is my name",
                 "what's my name", 
-                "what is your name",
-                "what's your name",
                 "who am i",
                 "my name",
                 "tell me my name",
@@ -453,6 +565,49 @@ def extract_keywords_from_text(text: str) -> List[str]:
         keywords = [word.strip('.,!?;:') for word in words if word not in common_words and len(word) > 2]
         return keywords
 
+def convert_personal_fact_pronouns(fact: str) -> str:
+    """
+    Convert personal facts from first person (my/me/I) to second person (your/you)
+    for when the bot responds to the user about their own information
+    """
+    converted = fact
+    
+    # Convert pronouns - be careful with word boundaries
+    pronoun_conversions = {
+        r'\bmy\b': 'your',
+        r'\bMe\b': 'You',
+        r'\bme\b': 'you',
+        r'\bI am\b': 'You are',
+        r'\bi am\b': 'you are',
+        r'\bI\b': 'You',
+        r'\bmyself\b': 'yourself',
+        r'\bMy\b': 'Your',
+    }
+    
+    for pattern, replacement in pronoun_conversions.items():
+        converted = re.sub(pattern, replacement, converted)
+    
+    return converted
+
+def process_pronouns_for_context(text: str, user) -> str:
+    """
+    Process pronouns to understand context better:
+    - 'you/your/yours' refers to the bot (Tejas AI)
+    - 'my/me/myself' refers to the user
+    """
+    processed_text = text
+    
+    # Get user's name if available
+    data = load_db()
+    uid = str(user.id)
+    user_name = "the user"
+    if uid in data["users"] and data["users"][uid].get("name"):
+        user_name = data["users"][uid]["name"]
+    
+    # Replace pronouns for better understanding
+    # Note: This is for internal processing, not changing the user's message display
+    return processed_text
+
 def is_topic_question(query: str) -> Optional[str]:
     """Check if query is asking 'what is [topic]' and extract the topic"""
     query_lower = query.lower().strip()
@@ -471,6 +626,58 @@ def is_topic_question(query: str) -> Optional[str]:
         match = re.search(pattern, query_lower)
         if match:
             return match.group(1).capitalize()
+    
+    return None
+
+def extract_specific_content(full_content: str, query: str) -> Optional[str]:
+    """Extract specific part of structured content based on query"""
+    query_lower = query.lower().strip()
+    lines = full_content.split('\n')
+    
+    # Check if asking about a specific term (like "law of segregation")
+    query_keywords = [word.strip('?.,!') for word in query_lower.split() if len(word) > 2]
+    
+    # Look for specific lines that match the query
+    matching_lines = []
+    for line in lines:
+        line_lower = line.lower()
+        
+        # Check for exact phrase matches first
+        if query_lower.replace('what is ', '').replace('what are ', '').replace('define ', '') in line_lower:
+            # If it's a bullet point or numbered item, return just that part
+            if line.strip().startswith(('-', '•')) or re.match(r'^\s*\d+\.', line):
+                return line.strip()
+            elif ':' in line:
+                return line.strip()
+        
+        # Check for keyword matches in specific structures
+        if any(keyword in line_lower for keyword in query_keywords if keyword not in ['what', 'is', 'are', 'the', 'of']):
+            if line.strip().startswith(('-', '•')) or re.match(r'^\s*\d+\.', line) or ':' in line:
+                matching_lines.append(line.strip())
+    
+    # If we found specific matching lines, return the best one
+    if matching_lines:
+        # Prefer exact matches or longer explanations
+        best_match = max(matching_lines, key=len)
+        return best_match
+    
+    # Check if asking about the main topic (like "genetics")
+    first_line = lines[0] if lines else ""
+    if any(keyword in first_line.lower() for keyword in query_keywords):
+        # For main topic questions, return the definition part
+        for line in lines[1:]:  # Skip the title
+            if line.strip() and not line.strip().startswith(('-', '•', '1.', '2.', '3.')):
+                if '.' in line and len(line.strip()) > 30:  # Likely a definition
+                    return line.strip()
+        
+        # If no good definition found, return the first few lines
+        definition_lines = []
+        for line in lines[:4]:  # First few lines
+            if line.strip() and not line.strip().startswith(('-', '•')):
+                definition_lines.append(line.strip())
+        
+        if definition_lines:
+            return '\n'.join(definition_lines)
     
     return None
 
@@ -505,9 +712,33 @@ def find_topic_definition(facts: List[str], topic: str) -> Optional[str]:
     return None
 
 def find_best_fact_match(facts: List[str], query: str) -> Optional[str]:
-    """Enhanced fact matching using keywords and semantic similarity"""
+    """Enhanced fact matching with specific support for structured notes"""
     if not facts:
         return None
+    
+    query_lower = query.lower().strip()
+    
+    # First, try to find specific sub-topic matches (like "law of segregation")
+    for fact in facts:
+        fact_lower = fact.lower()
+        
+        # Check for specific term matches within structured notes
+        if any(term in fact_lower for term in query_lower.split() if len(term) > 2):
+            # Look for specific definitions within the fact
+            lines = fact.split('\n') if '\n' in fact else [fact]
+            for line in lines:
+                line_lower = line.lower()
+                
+                # Check if this line contains the specific term being asked about
+                if all(word in line_lower for word in query_lower.split() if len(word) > 2):
+                    # If it's a bullet point or numbered item, return just that part
+                    if (line.strip().startswith('-') or line.strip().startswith('•') or 
+                        re.match(r'^\s*\d+\.', line)):
+                        return line.strip()
+                    
+                    # If it's part of a structured note, try to extract the relevant section
+                    if ':' in line and any(word in line_lower for word in query_lower.split()):
+                        return line.strip()
     
     # Check if this is a topic question first
     topic = is_topic_question(query)
@@ -573,20 +804,41 @@ def search_personal_facts(user, query: str) -> Optional[str]:
     if not facts:
         return None
     
-    # Check if this is a name question
+    query_lower = query.lower().strip()
+    
+    # Check specific personal info fields first (direct mapping)
+    specific_info_checks = [
+        (["age", "old", "how old"], "age", "You are {} years old."),
+        (["name", "called", "who am i", "who are you"], "name", "Your name is {}."),
+        (["from", "where", "location", "live"], "location", "You are from {}."),
+        (["work", "job", "study", "occupation", "do"], "occupation", "You work/study: {}."),
+        (["interest", "hobby", "like", "enjoy"], "interests", "Your interests are: {}."),
+        (["goal", "want", "achieve", "hope"], "goals", "Your goals are: {}."),
+    ]
+    
+    for keywords, field, template in specific_info_checks:
+        if any(keyword in query_lower for keyword in keywords):
+            field_value = user_data.get(field)
+            if field_value:
+                return template.format(field_value)
+    
+    # Check if this is a name question (legacy support)
     stored_name = user_data.get("name")
     if stored_name and is_name_question(query, stored_name):
         return f"Your name is {stored_name}."
     
-    # Enhanced fact matching
+    # Enhanced fact matching for personal_facts array
     best_match = find_best_fact_match(facts, query)
     if best_match:
-        return best_match
+        # Convert personal facts to use proper pronouns (my -> your)
+        converted_fact = convert_personal_fact_pronouns(best_match)
+        return converted_fact
     
     # Fallback to original fuzzy matching
     matches = get_close_matches(query, facts, n=1, cutoff=0.4)
     if matches:
-        return matches[0]
+        converted_fact = convert_personal_fact_pronouns(matches[0])
+        return converted_fact
     
     return None
 
@@ -594,22 +846,42 @@ def search_personal_facts(user, query: str) -> Optional[str]:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_stats_obj(user)
-    msg = (
-        f"👋 Hello {user.first_name} (`{user.id}`)\n\n"
-        "I am your unified FTM Knowledge Bot.\n\n"
-        "<b>Commands</b>:\n"
-        "/start - This message\n"
-        "/learn - Start learning mode (admins -> global; users -> personal)\n"
-        "/cancel - Stop learning mode\n"
-        "/edit - Edit stored global knowledge\n"
-        "/get - Download DB (admins only)\n"
-        "/stats - Show leaderboard (admins only)\n\n"
-        "How I work:\n"
-        "- Ask a question. I try exact match, then fuzzy global, then fuzzy personal.\n"
-        "- If I know: I send text + audio.\n"
-        "- If unknown: I ask if you want to teach me.\n"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    
+    # Check if this is a new user and collect personal info
+    data = load_db()
+    uid = str(user.id)
+    is_new_user = uid not in data["users"] or not data["users"][uid].get("info_collected", False)
+    
+    if is_new_user:
+        # Ask if they want to share personal information
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Yes, I'd like to share", callback_data="share_info_yes")],
+            [InlineKeyboardButton("No thanks, maybe later", callback_data="share_info_no")]
+        ])
+        msg = (
+            f"👋 Hello! I'm <b>Tejas AI</b> (Created by Fᴛᴍ Dᴇᴠᴇʟᴏᴘᴇʀᴢ)\n\n"
+            f"Nice to meet you, {user.first_name}! I'm here to help you learn and remember information.\n\n"
+            "Would you like to share some information about yourself so I can provide more personalized assistance?"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=kb)
+    else:
+        stored_name = data["users"][uid].get("name", user.first_name)
+        msg = (
+            f"👋 Welcome back, {stored_name}! I'm <b>Tejas AI</b> (Created by Fᴛᴍ Dᴇᴠᴇʟᴏᴘᴇʀᴢ)\n\n"
+            "<b>Commands</b>:\n"
+            "/start - This message\n"
+            "/learn - Start learning mode (admins -> global; users -> personal)\n"
+            "/cancel - Stop learning mode\n"
+            "/edit - Edit stored global knowledge\n"
+            "/get - Download DB (admins only)\n"
+            "/stats - Show leaderboard (admins only)\n\n"
+            "How I work:\n"
+            "- Ask a question. I try exact match, then fuzzy global, then fuzzy personal.\n"
+            "- If I know: I send text + audio.\n"
+            "- If unknown: I ask if you want to teach me.\n"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+    
     await send_log(context, f"User started bot: {user_repr(user)}")
 
 async def learn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -710,7 +982,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Nothing to do.")
             return
 
-        action, payload = data.split("|", 1)
+        # Handle callback data that may or may not have a payload
+        if "|" in data:
+            action, payload = data.split("|", 1)
+        else:
+            action = data
+            payload = None
         if action == "teach_yes":
             pending_questions[user.id] = payload
             await query.message.reply_text(f"📝 Okay! Please send the answer for:\n\n❓ {payload}")
@@ -719,6 +996,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "teach_no":
             await query.message.reply_text("👍 Okay, skipping this question.")
             await send_log(context, f"{user_repr(user)} skipped teaching.")
+
+        elif action == "share_info_yes":
+            # Start personal info collection
+            info_collection_sessions[user.id] = {"step": 0, "data": {}}
+            first_question = PERSONAL_INFO_QUESTIONS[0]["question"]
+            await query.message.reply_text(f"Great! Let's start with some basic information.\n\n{first_question}")
+            await send_log(context, f"{user_repr(user)} started personal info collection.")
+
+        elif action == "share_info_no":
+            # Mark as declined and proceed normally
+            data = load_db()
+            uid = str(user.id)
+            if uid in data["users"]:
+                data["users"][uid]["info_collected"] = True
+                data["users"][uid]["info_declined"] = True
+                save_db(data)
+            
+            msg = (
+                "No problem! You can always share information later if you change your mind.\n\n"
+                "<b>Commands</b>:\n"
+                "/start - This message\n"
+                "/learn - Start learning mode\n"
+                "/cancel - Stop learning mode\n\n"
+                "How I work:\n"
+                "- Ask me a question. I try to find exact matches, then fuzzy matches.\n"
+                "- If I know the answer: I send text + audio.\n"
+                "- If I don't know: I ask if you want to teach me.\n"
+            )
+            await query.message.reply_text(msg, parse_mode="HTML")
+            await send_log(context, f"{user_repr(user)} declined personal info collection.")
 
         elif action == "edit_select":
             qid = payload
@@ -796,6 +1103,55 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             return
 
+        # Enhanced pronoun processing for better understanding
+        text = process_pronouns_for_context(text, user)
+
+        # Handle personal info collection sessions
+        if user.id in info_collection_sessions:
+            session = info_collection_sessions[user.id]
+            step = session["step"]
+            
+            if step < len(PERSONAL_INFO_QUESTIONS):
+                question_key = PERSONAL_INFO_QUESTIONS[step]["key"]
+                session["data"][question_key] = text
+                
+                # Move to next question
+                step += 1
+                session["step"] = step
+                
+                if step < len(PERSONAL_INFO_QUESTIONS):
+                    next_question = PERSONAL_INFO_QUESTIONS[step]["question"]
+                    await msg.reply_text(f"Thanks! Next question:\n\n{next_question}")
+                else:
+                    # Finished collecting info
+                    info_collection_sessions.pop(user.id)
+                    
+                    # Save all collected info
+                    data = load_db()
+                    uid = str(user.id)
+                    for key, value in session["data"].items():
+                        data["users"][uid][key] = value
+                    data["users"][uid]["info_collected"] = True
+                    save_db(data)
+                    
+                    # Add to personal facts for searchability
+                    info_text = f"My name is {session['data'].get('name', 'not provided')}. I am {session['data'].get('age', 'unknown')} years old. I am from {session['data'].get('location', 'unknown')}. I work/study: {session['data'].get('occupation', 'not specified')}. My interests are: {session['data'].get('interests', 'not specified')}. My goals are: {session['data'].get('goals', 'not specified')}."
+                    add_personal_facts_from_text(user, info_text)
+                    
+                    msg_text = (
+                        "Perfect! I've learned about you. Here's what I remember:\n\n"
+                        f"• Name: {session['data'].get('name', 'Not provided')}\n"
+                        f"• Age: {session['data'].get('age', 'Not provided')}\n"
+                        f"• Location: {session['data'].get('location', 'Not provided')}\n"
+                        f"• Work/Study: {session['data'].get('occupation', 'Not provided')}\n"
+                        f"• Interests: {session['data'].get('interests', 'Not provided')}\n"
+                        f"• Goals: {session['data'].get('goals', 'Not provided')}\n\n"
+                        "Now you can ask me questions and I'll try my best to help! I understand that when you say 'you/your/yours' you're referring to me (Tejas AI), and when you say 'my/me/myself' you're referring to yourself."
+                    )
+                    await msg.reply_text(msg_text)
+                    await send_log(context, f"Completed personal info collection for {user_repr(user)}")
+            return
+
         # edit session handling (global knowledge editing)
         if user.id in edit_sessions:
             session = edit_sessions.pop(user.id)
@@ -866,13 +1222,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Then check global knowledge
         qid, entry = find_answer_by_question(text)
         if entry:
-            answer = entry.get("answer", "")
+            full_answer = entry.get("answer", "")
             taught_by = entry.get("taught_by", {})
             taught_by_str = f"{taught_by.get('username','unknown')} ({taught_by.get('id','?')})"
-            await msg.reply_text(f"💡 {answer}\n\n👤 Taught by: {taught_by_str}")
+            
+            # Extract specific part if possible
+            specific_answer = extract_specific_content(full_answer, text)
+            final_answer = specific_answer if specific_answer else full_answer
+            
+            await msg.reply_text(f"💡 {final_answer}")  # Line Y
             # TTS
             try:
-                bio = tts_bytes(answer)
+                bio = tts_bytes(final_answer)
                 await msg.reply_voice(bio)
             except Exception as e:
                 logger.error(f"TTS failed: {e}")
@@ -931,7 +1292,7 @@ if __name__ == "__main__":
     
     # Import and start web server in a separate thread
     try:
-        from web_server import run_web_server
+        from bot import run_web_server
         import threading
         
         # Start web server in background thread
