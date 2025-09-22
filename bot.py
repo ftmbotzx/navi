@@ -3,7 +3,6 @@
 """
 Simple Flask web server that returns success message
 """
-
 from flask import Flask
 import threading
 import logging
